@@ -33,8 +33,8 @@ app.add_middleware(
 app.include_router(homework_router)
 app.include_router(announcements_router)
 app.include_router(diagrams_router)
-app.include_router(study_router)
-app.include_router(materials_router)
+app.include_router(study_router)       # ← Add this line
+app.include_router(materials_router)    # ← Add this line
 
 
 # ---------------------------------------------------------------------------
