@@ -1,3 +1,5 @@
+# config.py - Complete file with correct embedding model names
+
 import os
 from dotenv import load_dotenv
 
@@ -9,6 +11,11 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+# Separate key for the study-tool endpoints (notes analysis / explain-a-concept
+# tabs, app/study.py). Kept independent from GEMINI_API_KEY used by the
+# persona/tutor chat system so usage and billing/quota don't share one key.
+STUDY_GEMINI_API_KEY = os.getenv("STUDY_GEMINI_API_KEY")
 
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
@@ -32,3 +39,44 @@ GEMINI_FALLBACK_MODELS = [
 ]
 GROQ_LLM_MODEL = "llama-3.3-70b-versatile"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
+
+# Separate from GEMINI_FALLBACK_MODELS in case the study-tool key is on a
+# different tier/quota and you want to tune its fallback order independently.
+STUDY_GEMINI_FALLBACK_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3-flash-preview",  # verify exact id if this ever 404s
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
+]
+
+# Used by app/materials.py (student-created Document Chat / RAG). Runs on
+# the same STUDY_GEMINI_API_KEY as the rest of the study-tool endpoints.
+# The embedding models available for embedContent are:
+# - "embedding-001" (older, 768 dimensions) 
+# - "text-embedding-004" (newer, 768 dimensions, better quality)
+# NOTE: Do NOT use "models/" prefix - just the model name
+STUDY_GEMINI_EMBEDDING_MODEL = os.getenv("STUDY_GEMINI_EMBEDDING_MODEL", "gemini-embedding-2-preview")
+# Fallback to the newer text-embedding-004 model
+STUDY_GEMINI_EMBEDDING_FALLBACK_MODEL = os.getenv("STUDY_GEMINI_EMBEDDING_FALLBACK_MODEL", "gemini-embedding-2-preview")
+
+# Must match the `vector(...)` column dimension in
+# app/migrations/materials_schema.sql — change both together if you tune
+# this. 768 (via output_dimensionality) keeps the ivfflat index cheap; the
+# embedding model's native size is larger.
+MATERIAL_EMBEDDING_DIM = 768
+
+# yt-dlp cookies, to get past YouTube's "Sign in to confirm you're not a
+# bot" block. Set ONE of these (not both) in your .env:
+#   YTDLP_COOKIES_BROWSER=chrome   -> reads cookies live from that browser
+#                                     (local dev only; browser must be closed;
+#                                      Windows Chrome hits a DPAPI decrypt
+#                                      error currently — use the file option
+#                                      below instead if you see that)
+#   YTDLP_COOKIES_FILE=path        -> reads an exported cookies.txt file
+#                                     (works on a real server too)
+# Leave YTDLP_COOKIES_BROWSER unset/empty in .env to use the file path.
+# Default file path matches this project's actual folder structure:
+# tutor-backend-v3/app/secrets/youtube_cookies.txt
+YTDLP_COOKIES_BROWSER = os.getenv("YTDLP_COOKIES_BROWSER", "")
+YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "./app/secrets/youtube_cookies.txt")
