@@ -7,17 +7,16 @@ from pydantic import BaseModel
 
 from app.config import ALLOWED_ORIGINS
 from app.supabase_client import supabase
-from app.auth import get_current_student, get_current_teacher
+from app.auth import get_current_student
 from app.ingestion import (
     fetch_transcript, build_persona_profile, build_persona_profile_from_youtube_chunked,
-    transcribe_uploaded_audio,
+    transcribe_uploaded_audio, extract_pdf_transcript_via_images,
 )
 from app.llm_providers import call_gemini_with_fallback
+from app.persona_rag import chunk_and_embed_persona, retrieve_relevant_solved_questions
 from app.homework import router as homework_router
 from app.announcements import router as announcements_router
 from app.diagrams import router as diagrams_router
-from app.study import router as study_router
-from app.materials import router as materials_router
 from app.notifications import send_notification_email
 
 app = FastAPI(title="Classroom Backend API")
@@ -33,12 +32,15 @@ app.add_middleware(
 app.include_router(homework_router)
 app.include_router(announcements_router)
 app.include_router(diagrams_router)
-app.include_router(study_router)       # ← Add this line
-app.include_router(materials_router)    # ← Add this line
 
 
 # ---------------------------------------------------------------------------
-# Persona creation (async — ingestion takes 10-15+ min for a full lecture)
+# Persona creation (async — ingestion takes 10-15+ min for a full lecture).
+#
+# Students create personas themselves now, from any of three sources:
+#   - a YouTube link              (POST /personas)
+#   - an uploaded audio/video file (POST /personas/upload)
+#   - an uploaded PDF              (POST /personas/upload-pdf, image-extraction only)
 # ---------------------------------------------------------------------------
 class CreatePersonaRequest(BaseModel):
     name: str
@@ -73,6 +75,8 @@ def _run_ingestion_job(persona_id: str, youtube_url: str):
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", persona_id).execute()
 
+        _index_persona_for_retrieval(persona_id, profile["solved_questions"])
+
     except Exception as e:
         supabase.table("personas").update({
             "status": "failed",
@@ -81,9 +85,22 @@ def _run_ingestion_job(persona_id: str, youtube_url: str):
         }).eq("id", persona_id).execute()
 
 
+def _index_persona_for_retrieval(persona_id: str, solved_questions: str) -> None:
+    """Chunks+embeds solved_questions into persona_chunks right after a
+    persona goes ready, so /study/ask and /personas/{id}/ask can retrieve
+    just the relevant records instead of resending the whole blob on every
+    call (see persona_rag.py). Best-effort: a failure here (e.g. schema_v5
+    not migrated yet) shouldn't fail persona ingestion — retrieval just
+    falls back to a bounded slice of the full text until this succeeds."""
+    try:
+        chunk_and_embed_persona(persona_id, solved_questions)
+    except Exception as e:
+        print(f"[WARN] persona_chunks indexing failed for {persona_id}: {e}")
+
+
 @app.post("/personas", status_code=202)
 def create_persona(req: CreatePersonaRequest, background_tasks: BackgroundTasks,
-                    teacher_id: str = Depends(get_current_teacher)):
+                    student_id: str = Depends(get_current_student)):
     result = supabase.table("personas").insert({
         "name": req.name,
         "source_youtube_url": req.youtube_url,
@@ -97,13 +114,16 @@ def create_persona(req: CreatePersonaRequest, background_tasks: BackgroundTasks,
 
 
 # ---------------------------------------------------------------------------
-# Persona creation from a manually-downloaded audio file — bypasses yt-dlp
-# and Gemini's YouTube-URL fetch entirely, since you already have the audio.
-# Useful when both of those are blocked/unavailable for a given video.
+# Persona creation from an uploaded audio or video file — bypasses yt-dlp
+# and Gemini's YouTube-URL fetch entirely, since the file is already on
+# hand. Video files go through the same path: ffmpeg pulls just the audio
+# track out in transcribe_uploaded_audio (see ingestion.py), so a video
+# upload is just as "audio-first" as the YouTube path.
 # ---------------------------------------------------------------------------
 ALLOWED_AUDIO_CONTENT_TYPES = (
     "audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav",
     "audio/mp4", "audio/x-m4a", "audio/m4a", "audio/ogg", "audio/webm",
+    "video/mp4", "video/webm", "video/quicktime", "video/x-matroska",
 )
 
 
@@ -122,6 +142,8 @@ def _run_ingestion_job_from_upload(persona_id: str, file_bytes: bytes, filename:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", persona_id).execute()
 
+        _index_persona_for_retrieval(persona_id, profile["solved_questions"])
+
     except Exception as e:
         supabase.table("personas").update({
             "status": "failed",
@@ -136,12 +158,12 @@ async def create_persona_from_upload(
     name: str = Form(...),
     source_youtube_url: str | None = Form(None),
     file: UploadFile = File(...),
-    teacher_id: str = Depends(get_current_teacher),
+    student_id: str = Depends(get_current_student),
 ):
     if file.content_type not in ALLOWED_AUDIO_CONTENT_TYPES:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type '{file.content_type}' — upload an mp3/m4a/wav/ogg audio file.",
+            detail=f"Unsupported file type '{file.content_type}' — upload an mp3/m4a/wav/ogg/mp4/mov/webm/mkv audio or video file.",
         )
 
     file_bytes = await file.read()
@@ -154,6 +176,64 @@ async def create_persona_from_upload(
 
     persona_id = result.data[0]["id"]
     background_tasks.add_task(_run_ingestion_job_from_upload, persona_id, file_bytes, file.filename or "audio.mp3")
+
+    return {"id": persona_id, "status": "processing"}
+
+
+# ---------------------------------------------------------------------------
+# Persona creation from an uploaded PDF — image extraction only. Every page
+# is rendered to an image and read with Gemini vision (see
+# extract_pdf_transcript_via_images in ingestion.py); there's no text-layer
+# extraction step anywhere in this path, by design.
+# ---------------------------------------------------------------------------
+def _run_ingestion_job_from_pdf(persona_id: str, file_bytes: bytes):
+    try:
+        transcript = extract_pdf_transcript_via_images(file_bytes)
+        if not transcript.strip():
+            raise ValueError("Couldn't read any content from this PDF — try a clearer scan.")
+        profile = build_persona_profile(transcript)
+
+        supabase.table("personas").update({
+            "status": "ready",
+            "teaching_style": profile["teaching_style"],
+            "topics_covered": profile["topics_covered"],
+            "problem_solving_approach": profile["problem_solving_approach"],
+            "solved_questions": profile["solved_questions"],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", persona_id).execute()
+
+        _index_persona_for_retrieval(persona_id, profile["solved_questions"])
+
+    except Exception as e:
+        supabase.table("personas").update({
+            "status": "failed",
+            "error_message": str(e),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", persona_id).execute()
+
+
+@app.post("/personas/upload-pdf", status_code=202)
+async def create_persona_from_pdf(
+    background_tasks: BackgroundTasks,
+    name: str = Form(...),
+    file: UploadFile = File(...),
+    student_id: str = Depends(get_current_student),
+):
+    if file.content_type != "application/pdf":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{file.content_type}' — upload a PDF file.",
+        )
+
+    file_bytes = await file.read()
+
+    result = supabase.table("personas").insert({
+        "name": name,
+        "status": "processing",
+    }).execute()
+
+    persona_id = result.data[0]["id"]
+    background_tasks.add_task(_run_ingestion_job_from_pdf, persona_id, file_bytes)
 
     return {"id": persona_id, "status": "processing"}
 
@@ -208,30 +288,7 @@ def ask_persona(persona_id: str, req: AskRequest, student_id: str = Depends(get_
     history.reverse()
     history_text = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in history)
 
-    system_prompt = f"""
-You are {persona['name']}, a teacher. Answer the student's question in your
-own authentic teaching style, using the reference material below where
-relevant. Stay in character as this teacher.
-
-TEACHING STYLE & TOPICS YOU'VE COVERED:
-{persona['teaching_style']}
-
-YOUR PROBLEM-SOLVING APPROACH:
-{persona['problem_solving_approach']}
-
-REFERENCE MATERIAL (questions you've solved before, for consistent method/notation):
-{persona['solved_questions']}
-
-RECENT CONVERSATION:
-{history_text}
-
-STUDENT'S NEW QUESTION:
-{req.question}
-
-Answer as {persona['name']}, in their teaching style, clearly and helpfully.
-""".strip()
-
-    answer = call_gemini_with_fallback(system_prompt)
+    answer = call_gemini_with_fallback(_build_persona_prompt(persona, req.question, history_text))
 
     supabase.table("messages").insert([
         {"conversation_id": conversation_id, "role": "student", "content": req.question},
@@ -242,6 +299,11 @@ Answer as {persona['name']}, in their teaching style, clearly and helpfully.
 
 
 def _build_persona_prompt(persona: dict, question: str, history_text: str) -> str:
+    # Retrieval-based, not a full dump of persona['solved_questions'] — see
+    # persona_rag.py. This field can be huge for a persona built from a
+    # full course, and was previously resent in full on every single
+    # question; only the records relevant to THIS question are included now.
+    relevant_solved_questions = retrieve_relevant_solved_questions(persona, question)
     return f"""
 You are {persona['name']}, a teacher. Answer the student's question in your
 own authentic teaching style, using the reference material below where
@@ -253,8 +315,9 @@ TEACHING STYLE & TOPICS YOU'VE COVERED:
 YOUR PROBLEM-SOLVING APPROACH:
 {persona['problem_solving_approach']}
 
-REFERENCE MATERIAL (questions you've solved before, for consistent method/notation):
-{persona['solved_questions']}
+REFERENCE MATERIAL (questions you've solved before that are closest to this one,
+for consistent method/notation):
+{relevant_solved_questions or "(no closely matching solved example on file — fall back to your general teaching style above.)"}
 
 RECENT CONVERSATION:
 {history_text}

@@ -8,3 +8,4 @@ groq
 google-genai
 pydantic
 python-multipart
+pymupdf

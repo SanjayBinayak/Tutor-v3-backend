@@ -237,16 +237,6 @@ def _get_owned_ready_material(material_id: str, student_id: str) -> dict:
 # don't mix well with "exactly one of these three, one of which is a file
 # upload" in a single body. All three kick off the same background pipeline.
 # ---------------------------------------------------------------------------
-@router.post("/from-youtube", status_code=202)
-def create_material_from_youtube(
-    background_tasks: BackgroundTasks,
-    title: str = Form(...),
-    youtube_url: str = Form(...),
-    student_id: str = Depends(get_current_student),
-):
-    material = _create_material_row(student_id, title, "youtube", source_ref=youtube_url)
-    background_tasks.add_task(_run_material_ingestion, material["id"], "youtube", {"youtube_url": youtube_url})
-    return {"id": material["id"], "status": "processing"}
 
 
 @router.post("/from-text", status_code=202)

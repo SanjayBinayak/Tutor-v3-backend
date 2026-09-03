@@ -17,6 +17,21 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 # persona/tutor chat system so usage and billing/quota don't share one key.
 STUDY_GEMINI_API_KEY = os.getenv("STUDY_GEMINI_API_KEY")
 
+# --- Optional second Gemini key per pool, for automatic key rotation -------
+# Gemini's free tier is metered PER GOOGLE CLOUD PROJECT, not per API key —
+# so a second key from a second Google account genuinely gets its own
+# separate free daily quota (unlike Groq, whose free-tier limits are
+# per-organization and are NOT multiplied by adding more keys — see
+# ingestion.py's docstring on _transcribe_chunk). If GEMINI_API_KEY_2 /
+# STUDY_GEMINI_API_KEY_2 are set, llm_providers.py will automatically fall
+# over to them once every model on the first key has failed/hit quota.
+# Leave unset to keep using a single key (existing behaviour).
+GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2", "")
+STUDY_GEMINI_API_KEY_2 = os.getenv("STUDY_GEMINI_API_KEY_2", "")
+
+GEMINI_API_KEYS = [k for k in (GEMINI_API_KEY, GEMINI_API_KEY_2) if k]
+STUDY_GEMINI_API_KEYS = [k for k in (STUDY_GEMINI_API_KEY, STUDY_GEMINI_API_KEY_2) if k]
+
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
@@ -57,8 +72,10 @@ STUDY_GEMINI_FALLBACK_MODELS = [
 # - "text-embedding-004" (newer, 768 dimensions, better quality)
 # NOTE: Do NOT use "models/" prefix - just the model name
 STUDY_GEMINI_EMBEDDING_MODEL = os.getenv("STUDY_GEMINI_EMBEDDING_MODEL", "gemini-embedding-2-preview")
-# Fallback to the newer text-embedding-004 model
-STUDY_GEMINI_EMBEDDING_FALLBACK_MODEL = os.getenv("STUDY_GEMINI_EMBEDDING_FALLBACK_MODEL", "gemini-embedding-2-preview")
+# Fallback to a genuinely different model — this previously defaulted to the
+# SAME model as STUDY_GEMINI_EMBEDDING_MODEL, so the "fallback" path never
+# actually helped if the primary model was down or quota'd out.
+STUDY_GEMINI_EMBEDDING_FALLBACK_MODEL = os.getenv("STUDY_GEMINI_EMBEDDING_FALLBACK_MODEL", "text-embedding-004")
 
 # Must match the `vector(...)` column dimension in
 # app/migrations/materials_schema.sql — change both together if you tune

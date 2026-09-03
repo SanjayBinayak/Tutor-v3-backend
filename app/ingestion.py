@@ -1,7 +1,10 @@
+import io
 import os
 import glob
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
+import pymupdf
 import yt_dlp
 from groq import Groq
 
@@ -9,8 +12,63 @@ from app.config import GROQ_API_KEY, GROQ_WHISPER_MODEL, YTDLP_COOKIES_FILE, YTD
 from app.llm_providers import (
     call_groq, call_openrouter, call_gemini_with_fallback,
     call_gemini_with_youtube_fallback, call_gemini_video_chunk_with_fallback,
-    analyze_section_with_fallback,
+    call_gemini_audio_with_fallback, analyze_section_with_fallback,
+    call_gemini_vision_with_fallback,
 )
+
+# ---------------------------------------------------------------------------
+# PDF ingestion — image extraction only. Every page is rendered to an image
+# and read with Gemini vision, never with a text-layer extractor. This is a
+# deliberate choice (not just a fallback for scanned pages): PDFs exported
+# from slides/handwritten notes often have an unreliable or missing text
+# layer, and reading every page as a photo keeps one consistent pipeline
+# instead of silently mixing two extraction qualities.
+# ---------------------------------------------------------------------------
+PDF_PAGE_OCR_PROMPT = """
+Transcribe ALL text and content visible on this page as accurately as
+possible. Preserve structure (headings, bullet points, numbered steps,
+equations, diagram labels) using plain text/markdown. If it's handwritten,
+do your best to read it faithfully — mark only genuinely illegible spots
+with [unclear]. Return ONLY the transcribed content for this page, nothing
+else (no preamble, no commentary).
+""".strip()
+
+PDF_OCR_DPI = 200
+PDF_OCR_MAX_CONCURRENCY = 5
+
+
+def _rasterize_pdf_page(file_bytes: bytes, page_index: int, dpi: int = PDF_OCR_DPI) -> bytes:
+    """Renders ONE page (0-indexed) of a PDF to PNG bytes."""
+    with pymupdf.open(stream=file_bytes, filetype="pdf") as doc:
+        pix = doc[page_index].get_pixmap(dpi=dpi)
+        return pix.tobytes("png")
+
+
+def extract_pdf_transcript_via_images(file_bytes: bytes) -> str:
+    """Turns a PDF into a single "transcript" string, page by page, by
+    rendering each page to an image and reading it with Gemini vision —
+    no pdfplumber/text-layer extraction anywhere in this path. Runs the
+    per-page vision calls concurrently since they're independent."""
+    with pymupdf.open(stream=file_bytes, filetype="pdf") as doc:
+        page_count = doc.page_count
+
+    def _ocr_page(page_index: int) -> tuple:
+        try:
+            png_bytes = _rasterize_pdf_page(file_bytes, page_index)
+            text = call_gemini_vision_with_fallback(PDF_PAGE_OCR_PROMPT, png_bytes, "image/png")
+            return page_index, (text or "").strip()
+        except Exception:
+            # Don't let one bad page (corrupt render, genuinely blank page)
+            # sink the whole upload — just skip it and keep the rest.
+            return page_index, ""
+
+    pages = {}
+    with ThreadPoolExecutor(max_workers=min(PDF_OCR_MAX_CONCURRENCY, max(page_count, 1))) as pool:
+        for page_index, text in pool.map(_ocr_page, range(page_count)):
+            if text:
+                pages[page_index] = text
+
+    return "\n\n".join(f"[Page {i + 1}]\n{pages[i]}" for i in sorted(pages))
 
 TEACHING_STYLE_AND_TOPICS_PROMPT = """
 Cover BOTH sections clearly labeled:
@@ -62,7 +120,16 @@ segment" for that section instead of guessing or padding.
 
 def _download_audio(youtube_url: str, out_name: str) -> str:
     base_opts = {
-        "format": "bestaudio/best",
+        # Audio-ONLY download (never the video stream) — this is what makes
+        # this "fast processing" in the first place: we never pull the
+        # (often 10-50x larger) video track just to throw it away a moment
+        # later. On top of that, prefer a stream at/under ~64kbps when one
+        # exists: _split_into_chunks re-encodes everything to 16kHz mono
+        # 32kbps anyway for Whisper, so a hi-fi 256kbps download buys us
+        # nothing but slower downloads — this trims that for slow/metered
+        # connections while still falling back to bestaudio if no
+        # low-bitrate stream is offered for this video.
+        "format": "bestaudio[abr<=64]/bestaudio/best",
         "outtmpl": f"{out_name}.%(ext)s",
         "quiet": True,
     }
@@ -124,30 +191,102 @@ def _split_into_chunks(input_path: str, chunk_seconds: int, out_prefix: str) -> 
     return chunks
 
 
+AUDIO_TRANSCRIBE_PROMPT = (
+    "Transcribe this audio exactly as spoken, word for word, in the language "
+    "it's spoken in. Return ONLY the transcript text — no preamble, no "
+    "timestamps, no speaker labels unless multiple speakers are clearly "
+    "distinguishable and it actually helps to mark them."
+)
+
+# Chunks are always written as mono 16kHz .ogg by _split_into_chunks.
+_CHUNK_MIME_TYPE = "audio/ogg"
+
+# Groq's free Whisper tier (as of 2026) is generous for this use case — 2,000
+# requests/day and ~8hrs of audio/day — but it IS a shared, per-organization
+# cap: unlike Gemini, spinning up extra Groq keys does not multiply that
+# quota, so there's no "rotate Groq keys" fallback worth building. What we
+# CAN do is fail over to a different provider entirely when Groq is
+# unavailable or that daily cap is hit.
+GROQ_TRANSIENT_ERROR_TOKENS = (
+    "429", "500", "502", "503", "504", "rate limit", "rate_limit",
+    "quota", "timeout", "timed out",
+)
+
+
 def _transcribe_chunk(audio_path: str) -> str:
-    client = Groq(api_key=GROQ_API_KEY)
-    with open(audio_path, "rb") as f:
-        result = client.audio.transcriptions.create(
-            file=f, model=GROQ_WHISPER_MODEL, response_format="text"
+    """
+    Transcribes one audio chunk. Groq Whisper is tried first (purpose-built
+    for speech-to-text, and fast) with a couple of quick retries on
+    transient errors; if Groq is down OR its free-tier daily quota has run
+    out, this automatically falls back to Gemini's native audio
+    understanding (call_gemini_audio_with_fallback) — which itself tries
+    every model in GEMINI_FALLBACK_MODELS, and every configured
+    GEMINI_API_KEY* in turn, before finally giving up. So a single chunk
+    only fails if BOTH Groq AND every Gemini model/key combination fail.
+    """
+    groq_error = None
+    for attempt in range(2):
+        try:
+            client = Groq(api_key=GROQ_API_KEY)
+            with open(audio_path, "rb") as f:
+                result = client.audio.transcriptions.create(
+                    file=f, model=GROQ_WHISPER_MODEL, response_format="text"
+                )
+            return result if isinstance(result, str) else result.text
+        except Exception as e:
+            groq_error = e
+            if attempt == 0 and any(tok in str(e).lower() for tok in GROQ_TRANSIENT_ERROR_TOKENS):
+                time.sleep(2)
+                continue
+            break
+
+    try:
+        with open(audio_path, "rb") as f:
+            audio_bytes = f.read()
+        return call_gemini_audio_with_fallback(AUDIO_TRANSCRIBE_PROMPT, audio_bytes, _CHUNK_MIME_TYPE)
+    except Exception as gemini_error:
+        raise RuntimeError(
+            f"Transcription failed on both providers for {os.path.basename(audio_path)}. "
+            f"Groq: {groq_error}. Gemini: {gemini_error}"
         )
-    return result if isinstance(result, str) else result.text
+
+
+def _transcribe_chunks(chunks: list, max_concurrency: int = 4) -> str:
+    """Transcribes every chunk of one lecture. Chunks are independent of
+    each other, so they're sent concurrently (bounded by max_concurrency —
+    comfortably under Groq's free-tier 20 RPM for Whisper) instead of one
+    at a time; a 1-hour lecture (~4 chunks at 15min each) that used to
+    transcribe serially now finishes in roughly the time of one chunk."""
+    if len(chunks) == 1:
+        return _transcribe_chunk(chunks[0])
+    with ThreadPoolExecutor(max_workers=min(max_concurrency, len(chunks))) as pool:
+        return "\n".join(pool.map(_transcribe_chunk, chunks))
 
 
 def fetch_transcript(youtube_url: str, work_dir: str) -> str:
+    """
+    Primary path for turning a YouTube lecture into text: downloads the
+    AUDIO TRACK ONLY (never the video) via _download_audio — this is the
+    fast-processing step, since audio is a small fraction of a video's
+    size/bandwidth — then splits it into ~15-min chunks and transcribes
+    each one (see _transcribe_chunks/_transcribe_chunk for the
+    Groq-then-Gemini fallback chain).
+    """
     audio_name = os.path.join(work_dir, "audio")
     audio_path = _download_audio(youtube_url, audio_name)
     chunks = _split_into_chunks(audio_path, chunk_seconds=900, out_prefix=audio_name)
-    return "\n".join(_transcribe_chunk(c) for c in chunks)
+    return _transcribe_chunks(chunks)
 
 
 def transcribe_uploaded_audio(file_bytes: bytes, filename: str, work_dir: str) -> str:
     """
     Same chunk+transcribe pipeline as fetch_transcript(), but starting from
-    audio bytes you already have (e.g. manually downloaded through a
-    browser) instead of having yt-dlp fetch them automatically. Since no
-    automated download happens at all, this sidesteps YouTube's
-    anti-automation blocking entirely — the trade-off is it's manual, one
-    file at a time.
+    audio/video bytes already on hand (a student's upload, or audio
+    manually downloaded through a browser) instead of having yt-dlp fetch
+    them. No automated download happens here at all — for a video file,
+    ffmpeg pulls just the audio track out of it in _split_into_chunks
+    (the video frames are never decoded/processed), so this is just as
+    "audio-first" as the YouTube path, it just starts one step later.
     """
     ext = os.path.splitext(filename or "")[1] or ".mp3"
     audio_name = os.path.join(work_dir, "audio")
@@ -156,7 +295,7 @@ def transcribe_uploaded_audio(file_bytes: bytes, filename: str, work_dir: str) -
         f.write(file_bytes)
 
     chunks = _split_into_chunks(input_path, chunk_seconds=900, out_prefix=audio_name)
-    return "\n".join(_transcribe_chunk(c) for c in chunks)
+    return _transcribe_chunks(chunks)
 
 
 def build_persona_profile(transcript: str) -> dict:
