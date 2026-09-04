@@ -18,6 +18,8 @@ from app.homework import router as homework_router
 from app.announcements import router as announcements_router
 from app.diagrams import router as diagrams_router
 from app.notifications import send_notification_email
+from app.quiz import router as quiz_router
+from app.conversations import router as conversations_router
 
 app = FastAPI(title="Classroom Backend API")
 
@@ -32,6 +34,8 @@ app.add_middleware(
 app.include_router(homework_router)
 app.include_router(announcements_router)
 app.include_router(diagrams_router)
+app.include_router(quiz_router)
+app.include_router(conversations_router)
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +274,7 @@ def ask_persona(persona_id: str, req: AskRequest, student_id: str = Depends(get_
     if persona["status"] != "ready":
         raise HTTPException(status_code=409, detail=f"Persona is not ready (status: {persona['status']})")
 
+    is_new_conversation = not req.conversation_id
     if req.conversation_id:
         convo = supabase.table("conversations").select("*") \
             .eq("id", req.conversation_id).eq("student_id", student_id).single().execute().data
@@ -277,8 +282,14 @@ def ask_persona(persona_id: str, req: AskRequest, student_id: str = Depends(get_
             raise HTTPException(status_code=404, detail="Conversation not found")
         conversation_id = convo["id"]
     else:
+        # Title starts out as a trimmed version of the student's first
+        # question, ChatGPT-style, so the history sidebar has something
+        # meaningful to show without an extra "name this chat" step.
+        title = req.question.strip()
+        if len(title) > 60:
+            title = title[:57].rstrip() + "…"
         convo = supabase.table("conversations").insert({
-            "persona_id": persona_id, "student_id": student_id
+            "persona_id": persona_id, "student_id": student_id, "title": title or "New chat",
         }).execute().data[0]
         conversation_id = convo["id"]
 
@@ -295,7 +306,13 @@ def ask_persona(persona_id: str, req: AskRequest, student_id: str = Depends(get_
         {"conversation_id": conversation_id, "role": "tutor", "content": answer},
     ]).execute()
 
-    return {"conversation_id": conversation_id, "answer": answer}
+    # Bumps updated_at so the history sidebar (GET /conversations) sorts
+    # this chat back to the top after a follow-up message.
+    supabase.table("conversations").update({
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }).eq("id", conversation_id).execute()
+
+    return {"conversation_id": conversation_id, "answer": answer, "is_new_conversation": is_new_conversation}
 
 
 def _build_persona_prompt(persona: dict, question: str, history_text: str) -> str:
