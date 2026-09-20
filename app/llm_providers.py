@@ -10,8 +10,9 @@ from google import genai
 from groq import Groq
 
 from app.config import (
-    GEMINI_API_KEY, GEMINI_API_KEYS, GROQ_API_KEY, OPENROUTER_API_KEY,
-    GEMINI_FALLBACK_MODELS, GROQ_LLM_MODEL,
+    GEMINI_API_KEY, GEMINI_API_KEYS, GROQ_API_KEY, GROQ_API_KEYS,
+    OPENROUTER_API_KEY, OPENROUTER_API_KEYS,
+    GEMINI_FALLBACK_MODELS, GROQ_LLM_MODEL, GROQ_FALLBACK_MODELS,
     STUDY_GEMINI_API_KEY, STUDY_GEMINI_API_KEYS, STUDY_GEMINI_FALLBACK_MODELS,
     STUDY_GEMINI_EMBEDDING_MODEL, STUDY_GEMINI_EMBEDDING_FALLBACK_MODEL,
     MATERIAL_EMBEDDING_DIM,
@@ -55,15 +56,6 @@ def _is_transient_error(e: Exception) -> bool:
     ))
 
 
-def _is_quota_exhausted_error(e: Exception) -> bool:
-    """Narrower than _is_transient_error: specifically a daily/quota cap,
-    not just a momentary rate limit or blip. Used only to decide whether
-    it's worth trying the SAME model again on the NEXT key (no point doing
-    that for a plain timeout or a 500, which a different key can't fix)."""
-    s = str(e).lower()
-    return any(tok in s for tok in ("429", "resource_exhausted", "quota", "rate limit", "rate_limit"))
-
-
 def _call_gemini_models(api_keys, models: list, make_request,
                          retries_per_model: int = 2, timeout_s: float = _DEFAULT_TIMEOUT_S) -> str:
     """
@@ -86,6 +78,11 @@ def _call_gemini_models(api_keys, models: list, make_request,
     doesn't immediately drop the request to a weaker fallback. A hard
     per-attempt timeout keeps one stuck call from blocking the whole chain.
 
+    A model that 404s (doesn't exist under this name/API version) is
+    remembered in `missing_models` and skipped on every subsequent key too
+    — a bad model name won't start existing just because a different key
+    tries it, so there's no point paying for that retry N times.
+
     api_keys may be a single key string (back-compat) or a list of keys.
     make_request(client, model) -> str does the actual API call.
     """
@@ -96,18 +93,25 @@ def _call_gemini_models(api_keys, models: list, make_request,
         raise RuntimeError("No Gemini API key configured.")
 
     last_error = None
+    missing_models: set = set()
     for key_idx, api_key in enumerate(api_keys):
         client = _get_genai_client(api_key)
         for model in models:
+            if model in missing_models:
+                continue
             for attempt in range(retries_per_model + 1):
                 try:
                     future = _shared_executor.submit(make_request, client, model)
                     return future.result(timeout=timeout_s)
                 except FutureTimeoutError:
                     last_error = TimeoutError(f"{model} timed out after {timeout_s}s (key #{key_idx + 1})")
-                    break  # timeouts aren't worth retrying on the same model
+                    break
                 except Exception as e:
                     last_error = e
+                    err_s = str(e).lower()
+                    if "404" in err_s or "not found" in err_s:
+                        missing_models.add(model)
+                        break
                     if attempt < retries_per_model and _is_transient_error(e):
                         time.sleep((2 ** attempt) * 1.0 + random.uniform(0, 0.5))
                         continue
@@ -118,13 +122,27 @@ def _call_gemini_models(api_keys, models: list, make_request,
 
 
 def call_groq(prompt: str) -> str:
-    """Call Groq's LLM API with the specified model."""
-    client = Groq(api_key=GROQ_API_KEY)
-    response = client.chat.completions.create(
-        model=GROQ_LLM_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.choices[0].message.content
+    """Call Groq with model then key fallback. Groq free limits are often
+    per-org, but extra keys are still tried if one key is invalid."""
+    keys = GROQ_API_KEYS or ([GROQ_API_KEY] if GROQ_API_KEY else [])
+    if not keys:
+        raise RuntimeError("GROQ_API_KEY not set")
+    last_error = None
+    for model in GROQ_FALLBACK_MODELS:
+        for key_idx, api_key in enumerate(keys):
+            try:
+                client = Groq(api_key=api_key)
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                last_error = e
+                if "404" in str(e).lower() or "not found" in str(e).lower():
+                    break
+                continue
+    raise RuntimeError(f"All Groq models/keys failed. Last error: {last_error}")
 
 
 def pick_openrouter_free_model() -> str:
@@ -139,16 +157,26 @@ def pick_openrouter_free_model() -> str:
 
 
 def call_openrouter(prompt: str) -> str:
-    """Call OpenRouter's API with a free model."""
+    """Call OpenRouter's API with a free model, walking up to 6 keys."""
+    keys = OPENROUTER_API_KEYS or ([OPENROUTER_API_KEY] if OPENROUTER_API_KEY else [])
+    if not keys:
+        raise RuntimeError("OPENROUTER_API_KEY not set")
     model_id = pick_openrouter_free_model()
-    response = requests.post(
-        url="https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-        json={"model": model_id, "messages": [{"role": "user", "content": prompt}]},
-        timeout=120,
-    )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    last_error = None
+    for key_idx, api_key in enumerate(keys):
+        try:
+            response = requests.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"model": model_id, "messages": [{"role": "user", "content": prompt}]},
+                timeout=120,
+            )
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            last_error = e
+            continue
+    raise RuntimeError(f"All OpenRouter keys failed. Last error: {last_error}")
 
 
 def _call_with_cross_provider_fallback(gemini_call, prompt: str) -> str:
@@ -384,35 +412,37 @@ def embed_texts_batch(texts: list, task_type: str = "RETRIEVAL_DOCUMENT",
     if not texts:
         return []
 
-    client = _get_genai_client(STUDY_GEMINI_API_KEY)
+    embed_keys = STUDY_GEMINI_API_KEYS or ([STUDY_GEMINI_API_KEY] if STUDY_GEMINI_API_KEY else GEMINI_API_KEYS)
+    if not embed_keys:
+        raise RuntimeError("No Gemini embedding key configured.")
     primary_model = STUDY_GEMINI_EMBEDDING_MODEL
     fallback_model = STUDY_GEMINI_EMBEDDING_FALLBACK_MODEL
-    # Guard against a misconfigured fallback that's identical to the primary
-    # model — that wouldn't actually help if the primary is down/quota'd.
     models_to_try = [primary_model] if fallback_model == primary_model else [primary_model, fallback_model]
 
     def embed_one_batch(batch: list) -> list:
         last_error = None
         for model in models_to_try:
-            for attempt in range(max_retries):
-                try:
-                    response = client.models.embed_content(
-                        model=model,
-                        contents=batch,
-                        config=genai_types.EmbedContentConfig(
-                            task_type=task_type,
-                            output_dimensionality=MATERIAL_EMBEDDING_DIM,
-                        ),
-                    )
-                    return [e.values for e in response.embeddings]
-                except Exception as e:
-                    last_error = e
-                    if attempt < max_retries - 1 and _is_transient_error(e):
-                        wait = (2 ** attempt) * 1.5 + random.uniform(0, 0.5)
-                        time.sleep(wait)
-                        continue
-                    break  # this model's exhausted its retries — try the next model
-        raise RuntimeError(f"Embedding failed for all models. Last error: {last_error}")
+            for key_idx, api_key in enumerate(embed_keys):
+                client = _get_genai_client(api_key)
+                for attempt in range(max_retries):
+                    try:
+                        response = client.models.embed_content(
+                            model=model,
+                            contents=batch,
+                            config=genai_types.EmbedContentConfig(
+                                task_type=task_type,
+                                output_dimensionality=MATERIAL_EMBEDDING_DIM,
+                            ),
+                        )
+                        return [e.values for e in response.embeddings]
+                    except Exception as e:
+                        last_error = e
+                        if attempt < max_retries - 1 and _is_transient_error(e):
+                            wait = (2 ** attempt) * 1.5 + random.uniform(0, 0.5)
+                            time.sleep(wait)
+                            continue
+                        break
+        raise RuntimeError(f"Embedding failed for all models/keys. Last error: {last_error}")
 
     batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
 

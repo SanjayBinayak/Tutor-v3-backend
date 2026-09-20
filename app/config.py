@@ -17,20 +17,39 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 # persona/tutor chat system so usage and billing/quota don't share one key.
 STUDY_GEMINI_API_KEY = os.getenv("STUDY_GEMINI_API_KEY")
 
-# --- Optional second Gemini key per pool, for automatic key rotation -------
-# Gemini's free tier is metered PER GOOGLE CLOUD PROJECT, not per API key —
-# so a second key from a second Google account genuinely gets its own
-# separate free daily quota (unlike Groq, whose free-tier limits are
-# per-organization and are NOT multiplied by adding more keys — see
-# ingestion.py's docstring on _transcribe_chunk). If GEMINI_API_KEY_2 /
-# STUDY_GEMINI_API_KEY_2 are set, llm_providers.py will automatically fall
-# over to them once every model on the first key has failed/hit quota.
-# Leave unset to keep using a single key (existing behaviour).
+def _collect_keys(*names: str) -> list:
+    seen = set()
+    out = []
+    for name in names:
+        value = (os.getenv(name) or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+# Up to 6 keys per pool. Extra Gemini keys only add quota if they belong
+# to different Google accounts/projects.
 GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2", "")
 STUDY_GEMINI_API_KEY_2 = os.getenv("STUDY_GEMINI_API_KEY_2", "")
-
-GEMINI_API_KEYS = [k for k in (GEMINI_API_KEY, GEMINI_API_KEY_2) if k]
-STUDY_GEMINI_API_KEYS = [k for k in (STUDY_GEMINI_API_KEY, STUDY_GEMINI_API_KEY_2) if k]
+GEMINI_API_KEYS = _collect_keys(
+    "GEMINI_API_KEY", "GEMINI_API_KEY_1", "GEMINI_API_KEY_2",
+    "GEMINI_API_KEY_3", "GEMINI_API_KEY_4", "GEMINI_API_KEY_5", "GEMINI_API_KEY_6",
+)
+STUDY_GEMINI_API_KEYS = _collect_keys(
+    "STUDY_GEMINI_API_KEY", "STUDY_GEMINI_API_KEY_1", "STUDY_GEMINI_API_KEY_2",
+    "STUDY_GEMINI_API_KEY_3", "STUDY_GEMINI_API_KEY_4", "STUDY_GEMINI_API_KEY_5",
+    "STUDY_GEMINI_API_KEY_6",
+)
+GROQ_API_KEYS = _collect_keys(
+    "GROQ_API_KEY", "GROQ_API_KEY_1", "GROQ_API_KEY_2", "GROQ_API_KEY_3",
+    "GROQ_API_KEY_4", "GROQ_API_KEY_5", "GROQ_API_KEY_6",
+)
+OPENROUTER_API_KEYS = _collect_keys(
+    "OPENROUTER_API_KEY", "OPENROUTER_API_KEY_1", "OPENROUTER_API_KEY_2",
+    "OPENROUTER_API_KEY_3", "OPENROUTER_API_KEY_4", "OPENROUTER_API_KEY_5",
+    "OPENROUTER_API_KEY_6",
+)
 
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
@@ -45,25 +64,51 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "")  # where "request a tutor" emails go
 
-GEMINI_FALLBACK_MODELS = [
-    "gemini-3.6-flash",
-    "gemini-3-flash-preview",  # verify exact id if this ever 404s
-    "gemini-2.5-flash-lite",
+# Text-out models only from the live Gemini quota list.
+# Skipped: 0/0 models, Nano Banana / image, TTS, Live, Veo, Lyria,
+# embeddings (used separately below), agents, Gemma-as-other, Omni.
+# Flash first for tutor quality; Lite later for leftover daily quota.
+_DEFAULT_GEMINI_TEXT_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+    "gemini-3-flash",
     "gemini-2.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite",
 ]
-GROQ_LLM_MODEL = "llama-3.3-70b-versatile"
+
+
+def _models_from_env(env_name: str, defaults: list) -> list:
+    raw = (os.getenv(env_name) or "").strip()
+    if raw:
+        extras = [part.strip() for part in raw.split(",") if part.strip()]
+        seen = set()
+        out = []
+        for model in extras + defaults:
+            if model not in seen:
+                seen.add(model)
+                out.append(model)
+        return out
+    return list(defaults)
+
+
+GEMINI_FALLBACK_MODELS = _models_from_env("GEMINI_FALLBACK_MODELS", _DEFAULT_GEMINI_TEXT_MODELS)
+GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
+GROQ_FALLBACK_MODELS = _models_from_env(
+    "GROQ_FALLBACK_MODELS",
+    [GROQ_LLM_MODEL, "llama-3.1-8b-instant"],
+)
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
 # Separate from GEMINI_FALLBACK_MODELS in case the study-tool key is on a
 # different tier/quota and you want to tune its fallback order independently.
-STUDY_GEMINI_FALLBACK_MODELS = [
-    "gemini-3.6-flash",
-    "gemini-3-flash-preview",  # verify exact id if this ever 404s
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-3.5-flash-lite",
-]
+STUDY_GEMINI_FALLBACK_MODELS = _models_from_env(
+    "STUDY_GEMINI_FALLBACK_MODELS",
+    _DEFAULT_GEMINI_TEXT_MODELS,
+)
 
 # Used by app/materials.py (student-created Document Chat / RAG). Runs on
 # the same STUDY_GEMINI_API_KEY as the rest of the study-tool endpoints.
